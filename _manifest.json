@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.qipi128-blip.qzone-pilot",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "name": "QQ空间动态管家",
   "description": "让模型自主决定何时发说说，并浏览好友动态、按人设决定是否评论；支持活动时间、每日上限、演练模式和去重。",
   "author": {
