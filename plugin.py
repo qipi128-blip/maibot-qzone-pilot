@@ -870,14 +870,15 @@ class QZonePilotPlugin(MaiBotPlugin):
             user_info = info.get("user_info")
             if not isinstance(user_info, dict):
                 continue
+            group_info = info.get("group_info")
+            if not isinstance(group_info, dict):
+                # 默认只参考群聊，避免把私聊内容带到公开的 QQ 空间。
+                continue
             user_id = str(user_info.get("user_id") or "").strip()
             if self_id and user_id == self_id:
                 continue
             nickname = str(user_info.get("user_cardname") or user_info.get("user_nickname") or user_id).strip()
-            group_info = info.get("group_info")
-            group_name = ""
-            if isinstance(group_info, dict):
-                group_name = str(group_info.get("group_name") or "").strip()
+            group_name = str(group_info.get("group_name") or "").strip()
             timestamp = _safe_float(message.get("timestamp"), default=0.0)
             time_text = time.strftime("%H:%M", time.localtime(timestamp)) if timestamp > 0 else "--:--"
             prefix = f"{group_name}/{nickname}" if group_name else nickname
