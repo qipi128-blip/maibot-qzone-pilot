@@ -568,7 +568,7 @@ class QZoneClient:
                 )
 
         return Feed(
-            target_qq=str(message.get("uin") or target_qq).strip(),
+            target_qq=target_qq,
             tid=tid,
             author=_decode_text(message.get("name")),
             created_at=created_at,

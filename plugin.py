@@ -496,6 +496,7 @@ class QZonePilotPlugin(MaiBotPlugin):
                     if await self._maybe_comment_feed(feed):
                         commented_count += 1
                         self._mark_feed_seen(feed)
+                        comments_allowed = False
                         break
                 self._mark_feed_seen(feed)
 
