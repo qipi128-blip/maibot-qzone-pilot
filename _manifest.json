@@ -1,0 +1,53 @@
+{
+  "manifest_version": 2,
+  "id": "github.qipi128-blip.qzone-pilot",
+  "version": "1.0.0",
+  "name": "QQ空间动态管家",
+  "description": "让模型自主决定何时发说说，并浏览好友动态、按人设决定是否评论；支持活动时间、每日上限、演练模式和去重。",
+  "author": {
+    "name": "Tyler",
+    "url": "https://github.com/qipi128-blip"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/qipi128-blip/maibot-qzone-pilot",
+    "homepage": "https://github.com/qipi128-blip/maibot-qzone-pilot",
+    "documentation": "https://github.com/qipi128-blip/maibot-qzone-pilot#readme",
+    "issues": "https://github.com/qipi128-blip/maibot-qzone-pilot/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "999.999.999"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.9.0"
+    }
+  ],
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.svg",
+      "fallback": "cloud",
+      "background": "#0ea5e9"
+    }
+  },
+  "capabilities": [
+    "llm.generate",
+    "config.get",
+    "message.get_by_time"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
