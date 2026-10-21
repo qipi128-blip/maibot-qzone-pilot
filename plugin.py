@@ -29,11 +29,14 @@ from .config import QZonePilotConfig
 from .decision import (
     CommentDecision,
     PublishDecision,
+    ReplyDecision,
     build_comment_messages,
     build_publish_messages,
+    build_reply_messages,
     is_too_similar,
     parse_comment_decision,
     parse_publish_decision,
+    parse_reply_decision,
 )
 from .napcat import NapCatClient, NapCatEndpoint, NapCatError, discover_endpoint, ensure_action_ok
 from .qzone import Feed, QZoneAuth, QZoneClient, QZoneError
@@ -102,6 +105,7 @@ class QZonePilotPlugin(MaiBotPlugin):
         self._browse_cursor = 0
         self._publish_task: asyncio.Task[None] | None = None
         self._browse_task: asyncio.Task[None] | None = None
+        self._reply_task: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._stopped = False
         self._last_error_notify_at = 0.0
@@ -135,15 +139,16 @@ class QZonePilotPlugin(MaiBotPlugin):
         """停止任务、连接并保存状态。"""
 
         self._stopped = True
-        for task in (self._publish_task, self._browse_task):
+        for task in (self._publish_task, self._browse_task, self._reply_task):
             if task is not None and not task.done():
                 task.cancel()
-        for task in (self._publish_task, self._browse_task):
+        for task in (self._publish_task, self._browse_task, self._reply_task):
             if task is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         self._publish_task = None
         self._browse_task = None
+        self._reply_task = None
 
         for task in list(self._tasks):
             if not task.done():
@@ -257,13 +262,20 @@ class QZonePilotPlugin(MaiBotPlugin):
             self._publish_task = asyncio.create_task(self._publish_loop())
         if self.config.browse.enabled and self._browse_task is None:
             self._browse_task = asyncio.create_task(self._browse_loop())
+        if self.config.reply.enabled and self._reply_task is None:
+            self._reply_task = asyncio.create_task(self._reply_loop())
 
     async def _stop_schedulers(self) -> None:
         """停止后台任务。"""
 
-        tasks = [task for task in (self._publish_task, self._browse_task) if task is not None]
+        tasks = [
+            task
+            for task in (self._publish_task, self._browse_task, self._reply_task)
+            if task is not None
+        ]
         self._publish_task = None
         self._browse_task = None
+        self._reply_task = None
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -302,6 +314,22 @@ class QZonePilotPlugin(MaiBotPlugin):
                 self.ctx.logger.error("浏览好友动态任务异常: %s", exc, exc_info=True)
                 await self._notify_error(f"浏览好友动态异常：{exc}")
             await asyncio.sleep(self._next_sleep(self.config.browse.check_interval_minutes, self.config.browse.jitter_seconds))
+
+    async def _reply_loop(self) -> None:
+        """回复自己说说评论的后台循环。"""
+
+        initial_delay = max(0, int(self.config.reply.initial_delay_seconds))
+        if initial_delay:
+            await asyncio.sleep(initial_delay)
+        while not self._stopped:
+            try:
+                await self._maybe_reply()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ctx.logger.error("回复评论任务异常: %s", exc, exc_info=True)
+                await self._notify_error(f"回复评论任务异常：{exc}")
+            await asyncio.sleep(self._next_sleep(self.config.reply.check_interval_minutes, self.config.reply.jitter_seconds))
 
     @staticmethod
     def _next_sleep(interval_minutes: int, jitter_seconds: int) -> float:
@@ -463,6 +491,10 @@ class QZonePilotPlugin(MaiBotPlugin):
             self._save_state()
             return False, "没有可浏览的好友，请配置 watch_friends 或开启 auto_friends。"
 
+        likes_allowed = (
+            browse.like_enabled
+            and (self._daily_count("likes") < browse.max_likes_per_day)
+        )
         comments_allowed = (
             browse.comment_enabled
             and (self._daily_count("comments") < browse.max_comments_per_day)
@@ -471,9 +503,11 @@ class QZonePilotPlugin(MaiBotPlugin):
                 or now - float(self._state.get("last_comment_at") or 0) >= browse.min_comment_interval_minutes * 60
             )
         )
+        interactions_enabled = browse.like_enabled or browse.comment_enabled
 
         candidate_count = 0
         commented_count = 0
+        liked_count = 0
         seen_count = 0
         for target in targets:
             try:
@@ -491,33 +525,63 @@ class QZonePilotPlugin(MaiBotPlugin):
                     continue
 
                 seen_count += 1
-                if comments_allowed and candidate_count < browse.max_candidates_per_cycle:
-                    candidate_count += 1
-                    if await self._maybe_comment_feed(feed):
-                        commented_count += 1
-                        self._mark_feed_seen(feed)
-                        comments_allowed = False
-                        break
+                if not interactions_enabled or (not comments_allowed and not likes_allowed):
+                    self._mark_feed_seen(feed)
+                    continue
+                if candidate_count >= browse.max_candidates_per_cycle:
+                    self._mark_feed_seen(feed)
+                    continue
+
+                candidate_count += 1
+                liked, commented = await self._maybe_interact_feed(
+                    feed,
+                    allow_like=likes_allowed,
+                    allow_comment=comments_allowed,
+                )
+                if liked:
+                    liked_count += 1
+                    likes_allowed = browse.like_enabled and (
+                        self._daily_count("likes") < browse.max_likes_per_day
+                    )
+                if commented:
+                    commented_count += 1
+                    comments_allowed = False
                 self._mark_feed_seen(feed)
 
         self._state["last_browse_at"] = now
         self._save_state()
-        if commented_count:
-            return True, f"浏览了 {len(targets)} 位好友，评论了 {commented_count} 条动态。"
-        return True, f"浏览了 {len(targets)} 位好友，共 {seen_count} 条新动态，没有评论。"
+        if commented_count or liked_count:
+            return True, (
+                f"浏览了 {len(targets)} 位好友，点赞 {liked_count} 条，评论 {commented_count} 条。"
+            )
+        return True, f"浏览了 {len(targets)} 位好友，共 {seen_count} 条新动态，没有互动。"
 
-    async def _maybe_comment_feed(self, feed: Feed) -> bool:
-        """让模型决定并执行一条动态的评论。"""
+    async def _maybe_interact_feed(
+        self,
+        feed: Feed,
+        *,
+        allow_like: bool,
+        allow_comment: bool,
+    ) -> tuple[bool, bool]:
+        """让模型决定并执行一条动态的点赞 / 评论。
+
+        Returns:
+            tuple[bool, bool]: ``(是否点赞成功, 是否评论成功)``。
+        """
 
         if feed.secret != 0 or feed.ugc_right not in {1, 4}:
-            return False
+            return False, False
         if not feed.content and not feed.images:
-            return False
+            return False, False
         if self._looks_like_ad(feed.content):
-            self.ctx.logger.info("动态疑似广告，跳过评论: %s", feed.tid)
-            return False
-        if feed.self_commented(self._auth.uin if self._auth else ""):
-            return False
+            self.ctx.logger.info("动态疑似广告，跳过互动: %s", feed.tid)
+            return False, False
+
+        self_uin = self._auth.uin if self._auth else ""
+        if feed.self_commented(self_uin) and self.config.browse.skip_if_commented:
+            allow_comment = False
+        if not allow_like and not allow_comment:
+            return False, False
 
         bot_name, persona = await self._get_persona_and_name()
         messages = build_comment_messages(
@@ -529,44 +593,109 @@ class QZonePilotPlugin(MaiBotPlugin):
         )
         raw = await self._call_llm(messages, temperature=self.config.llm.comment_temperature)
         if raw is None:
-            return False
+            return False, False
 
         decision = parse_comment_decision(raw, max_chars=self.config.browse.comment_max_chars)
         if decision is None:
-            self.ctx.logger.warning("模型评论输出无法解析: %s", raw[:300])
-            return False
-        if not decision.should_comment:
-            self.ctx.logger.info("模型决定不评论 %s：%s", feed.tid, decision.reason)
-            return False
-        if decision.confidence < self.config.browse.min_confidence:
-            self.ctx.logger.info("评论置信度不足: %.2f", decision.confidence)
-            return False
-        comment = self._clean_comment(decision.comment)
-        if not comment or self._is_generic_comment(comment):
-            return False
+            self.ctx.logger.warning("模型互动输出无法解析: %s", raw[:300])
+            return False, False
 
-        if self.config.plugin.dry_run:
-            if self.config.notify.notify_on_comment:
-                await self._notify_admin(
-                    f"🧪 [演练] 本来要评论 {feed.author or feed.target_qq} 的动态：\n"
-                    f"{feed.content[:200]}\n\n评论：{comment}\n理由：{decision.reason}"
-                )
-            return False
+        liked = False
+        commented = False
 
-        try:
-            await self._qzone_comment(feed.tid, feed.target_qq, comment)
-        except Exception as exc:
-            self.ctx.logger.warning("评论动态失败: %s", exc)
-            await self._notify_error(f"评论动态失败：{exc}")
-            return False
+        if (
+            decision.should_like
+            and allow_like
+            and not self._feed_liked(feed)
+            and decision.confidence >= self.config.browse.like_min_confidence
+        ):
+            if self.config.plugin.dry_run:
+                if self.config.notify.notify_on_like:
+                    await self._notify_admin(
+                        f"🧪 [演练] 本来要点赞 {feed.author or feed.target_qq} 的动态：\n"
+                        f"{feed.content[:200]}\n理由：{decision.reason}"
+                    )
+            else:
+                try:
+                    await self._qzone_like(feed.tid, feed.target_qq)
+                    self._record_like(feed=feed, decision=decision)
+                    liked = True
+                    if self.config.notify.notify_on_like:
+                        await self._notify_admin(
+                            f"👍 已点赞 {feed.author or feed.target_qq} 的动态（tid={feed.tid}）\n"
+                            f"动态：{feed.content[:160]}\n理由：{decision.reason}"
+                        )
+                except Exception as exc:
+                    self.ctx.logger.warning("点赞动态失败: %s", exc)
+                    await self._notify_error(f"点赞动态失败：{exc}")
 
-        self._record_comment(feed=feed, comment=comment, decision=decision)
-        if self.config.notify.notify_on_comment:
-            await self._notify_admin(
-                f"💬 已评论 {feed.author or feed.target_qq} 的动态（tid={feed.tid}）\n"
-                f"动态：{feed.content[:160]}\n评论：{comment}\n理由：{decision.reason}"
-            )
-        return True
+        if (
+            decision.should_comment
+            and allow_comment
+            and decision.confidence >= self.config.browse.min_confidence
+        ):
+            comment = self._clean_comment(decision.comment)
+            if comment and not self._is_generic_comment(comment):
+                if self.config.plugin.dry_run:
+                    if self.config.notify.notify_on_comment:
+                        await self._notify_admin(
+                            f"🧪 [演练] 本来要评论 {feed.author or feed.target_qq} 的动态：\n"
+                            f"{feed.content[:200]}\n\n评论：{comment}\n理由：{decision.reason}"
+                        )
+                else:
+                    try:
+                        await self._qzone_comment(feed.tid, feed.target_qq, comment)
+                        self._record_comment(feed=feed, comment=comment, decision=decision)
+                        commented = True
+                        if self.config.notify.notify_on_comment:
+                            await self._notify_admin(
+                                f"💬 已评论 {feed.author or feed.target_qq} 的动态（tid={feed.tid}）\n"
+                                f"动态：{feed.content[:160]}\n评论：{comment}\n理由：{decision.reason}"
+                            )
+                    except Exception as exc:
+                        self.ctx.logger.warning("评论动态失败: %s", exc)
+                        await self._notify_error(f"评论动态失败：{exc}")
+
+        return liked, commented
+
+    def _record_like(self, *, feed: Feed, decision: CommentDecision) -> None:
+        """记录一次点赞。"""
+
+        now = time.time()
+        history = self._state.get("like_history")
+        if not isinstance(history, list):
+            history = []
+            self._state["like_history"] = history
+        history.append(
+            {
+                "time": now,
+                "target_qq": feed.target_qq,
+                "author": feed.author,
+                "tid": feed.tid,
+                "content": feed.content[:300],
+                "reason": decision.reason,
+                "confidence": decision.confidence,
+            }
+        )
+        self._state["like_history"] = history[-_MAX_HISTORY:]
+        self._mark_feed_liked(feed)
+        self._state["last_like_at"] = now
+        self._increment_daily("likes")
+        self._increment_stat("likes")
+        self._save_state()
+
+    def _feed_liked(self, feed: Feed) -> bool:
+        """判断动态是否已经点过赞。"""
+
+        liked = self._state.get("liked_feeds")
+        return isinstance(liked, dict) and feed.tid in liked
+
+    def _mark_feed_liked(self, feed: Feed) -> None:
+        """标记动态已点赞。"""
+
+        liked = self._state.setdefault("liked_feeds", {})
+        if isinstance(liked, dict):
+            liked[feed.tid] = time.time()
 
     def _record_comment(self, *, feed: Feed, comment: str, decision: CommentDecision) -> None:
         """记录一条评论历史。"""
@@ -593,6 +722,230 @@ class QZonePilotPlugin(MaiBotPlugin):
         self._increment_daily("comments")
         self._increment_stat("comments")
         self._save_state()
+
+    # ---------------------------------------------------------------- 回复评论
+
+    async def _maybe_reply(self, *, force: bool = False) -> tuple[bool, str]:
+        """检查自己说说下的新评论并决定是否回复。"""
+
+        reply_config = self.config.reply
+        if not reply_config.enabled:
+            return False, "自动回复评论未启用。"
+
+        now = time.time()
+        if not force:
+            if not self._in_active_hours(reply_config.active_hours_start, reply_config.active_hours_end):
+                return False, "当前不在回复评论的活动时间。"
+            if self._daily_count("replies") >= reply_config.max_replies_per_day:
+                return False, "今天回复评论次数已达上限。"
+
+        try:
+            auth = await self._get_auth()
+            feeds = await self._qzone_get_feeds(auth.uin, num=reply_config.own_post_limit)
+        except Exception as exc:
+            self.ctx.logger.warning("读取自己说说评论失败: %s", exc)
+            return False, f"读取自己说说评论失败：{exc}"
+
+        self._remember_inspiration(feeds)
+        replied_count = 0
+        candidate_count = 0
+        for feed in feeds:
+            if feed.created_at > 0 and now - feed.created_at > reply_config.max_post_age_hours * 3600:
+                continue
+            for comment in feed.comments:
+                if comment.is_self or comment.uin == auth.uin:
+                    continue
+                if not comment.tid:
+                    continue
+                if comment.created_at > 0 and now - comment.created_at > reply_config.max_comment_age_hours * 3600:
+                    continue
+
+                key = self._reply_key(feed, comment)
+                if not key or self._reply_seen(key) or self._already_replied(feed, comment, auth.uin):
+                    self._mark_reply_seen(key)
+                    continue
+
+                if candidate_count >= reply_config.max_comments_per_cycle:
+                    break
+                if self._daily_count("replies") >= reply_config.max_replies_per_day:
+                    break
+                if replied_count >= reply_config.max_replies_per_cycle:
+                    break
+
+                candidate_count += 1
+                replied = await self._maybe_reply_one(feed, comment, auth.uin)
+                self._mark_reply_seen(key)
+                if replied:
+                    replied_count += 1
+                    break
+
+        self._save_state()
+        if replied_count:
+            return True, f"回复了 {replied_count} 条评论。"
+        return True, f"检查了 {len(feeds)} 条自己的说说，没有需要回复的新评论。"
+
+    async def _maybe_reply_one(self, feed: Feed, comment: Any, self_uin: str) -> bool:
+        """让模型决定并发送一条评论回复。"""
+
+        reply_config = self.config.reply
+        bot_name, persona = await self._get_persona_and_name()
+        messages = build_reply_messages(
+            bot_name=bot_name,
+            persona=persona,
+            feed_text=feed.content or feed.rt_con,
+            comment_text=f"{comment.nickname or comment.uin}：{comment.content}",
+            max_chars=reply_config.reply_max_chars,
+            style=self.config.prompt.reply_style,
+        )
+        raw = await self._call_llm(messages, temperature=self.config.llm.comment_temperature)
+        if raw is None:
+            return False
+
+        decision = parse_reply_decision(raw, max_chars=reply_config.reply_max_chars)
+        if decision is None:
+            self.ctx.logger.warning("模型回复决策无法解析: %s", raw[:300])
+            return False
+        if not decision.should_reply:
+            self.ctx.logger.info("模型决定不回复 %s：%s", comment.tid, decision.reason)
+            return False
+        if decision.confidence < reply_config.min_confidence:
+            self.ctx.logger.info("回复置信度不足: %.2f", decision.confidence)
+            return False
+
+        reply_text = self._clean_comment(decision.reply)
+        if not reply_text or self._is_generic_comment(reply_text):
+            return False
+
+        if self.config.plugin.dry_run:
+            if self.config.notify.notify_on_reply:
+                await self._notify_admin(
+                    f"🧪 [演练] 本来要回复 {comment.nickname or comment.uin} 的评论：\n"
+                    f"{comment.content[:200]}\n\n回复：{reply_text}\n理由：{decision.reason}"
+                )
+            return False
+
+        try:
+            await self._qzone_reply(
+                feed.tid,
+                feed.target_qq or self_uin,
+                target_nickname=comment.nickname,
+                target_comment_qq=comment.uin,
+                comment_tid=comment.tid or 0,
+                content=reply_text,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("回复评论失败: %s", exc)
+            await self._notify_error(f"回复评论失败：{exc}")
+            return False
+
+        self._record_reply(feed=feed, comment=comment, reply=reply_text, decision=decision)
+        if self.config.notify.notify_on_reply:
+            await self._notify_admin(
+                f"💬 已回复 {comment.nickname or comment.uin} 的评论（说说 tid={feed.tid}）\n"
+                f"评论：{comment.content[:160]}\n回复：{reply_text}\n理由：{decision.reason}"
+            )
+        return True
+
+    @staticmethod
+    def _reply_key(feed: Feed, comment: Any) -> str:
+        """构造评论去重键。"""
+
+        if comment.tid:
+            return f"{feed.tid}:{comment.tid}"
+        if comment.uin and comment.content:
+            return f"{feed.tid}:{comment.uin}:{comment.created_time}:{comment.content[:60]}"
+        return ""
+
+    def _reply_seen(self, key: str) -> bool:
+        """判断评论是否已经检查过。"""
+
+        seen = self._state.get("reply_seen")
+        return isinstance(seen, dict) and key in seen
+
+    def _mark_reply_seen(self, key: str) -> None:
+        """标记评论已经检查过。"""
+
+        if not key:
+            return
+        seen = self._state.setdefault("reply_seen", {})
+        if isinstance(seen, dict):
+            seen[key] = time.time()
+
+    def _already_replied(self, feed: Feed, comment: Any, self_uin: str) -> bool:
+        """检查该评论下是否已经有自己的回复。"""
+
+        if not comment.tid:
+            return False
+        for other in feed.comments:
+            if other.parent_tid == comment.tid and (other.is_self or other.uin == self_uin):
+                return True
+        return False
+
+    def _record_reply(self, *, feed: Feed, comment: Any, reply: str, decision: ReplyDecision) -> None:
+        """记录一次评论回复。"""
+
+        now = time.time()
+        key = self._reply_key(feed, comment)
+        replied = self._state.get("replied_comments")
+        if not isinstance(replied, dict):
+            replied = {}
+            self._state["replied_comments"] = replied
+        if key:
+            replied[key] = {
+                "time": now,
+                "target_qq": feed.target_qq,
+                "tid": feed.tid,
+                "comment_tid": comment.tid,
+                "comment_uin": comment.uin,
+                "comment_nickname": comment.nickname,
+                "comment": comment.content[:300],
+                "reply": reply,
+            }
+        history = self._state.get("reply_history")
+        if not isinstance(history, list):
+            history = []
+            self._state["reply_history"] = history
+        history.append(
+            {
+                "time": now,
+                "target_qq": feed.target_qq,
+                "tid": feed.tid,
+                "comment_tid": comment.tid,
+                "comment": comment.content[:300],
+                "reply": reply,
+                "reason": decision.reason,
+                "confidence": decision.confidence,
+            }
+        )
+        self._state["reply_history"] = history[-_MAX_HISTORY:]
+        self._state["last_reply_at"] = now
+        self._increment_daily("replies")
+        self._increment_stat("replies")
+        self._save_state()
+
+    async def _qzone_reply(
+        self,
+        fid: str,
+        target_qq: str,
+        *,
+        target_nickname: str,
+        target_comment_qq: str,
+        comment_tid: int | str,
+        content: str,
+    ) -> None:
+        """回复说说评论。"""
+
+        async def operation(client: QZoneClient) -> None:
+            await client.reply(
+                fid,
+                target_qq,
+                target_nickname=target_nickname,
+                target_comment_qq=target_comment_qq,
+                comment_tid=comment_tid,
+                content=content,
+            )
+
+        await self._with_qzone(operation)
 
     async def _resolve_browse_targets(self, target_qq: str = "") -> list[str]:
         """确定本轮要浏览的好友列表。"""
@@ -659,10 +1012,6 @@ class QZonePilotPlugin(MaiBotPlugin):
             return False
         if now - feed.created_at > self.config.browse.max_feed_age_hours * 3600:
             return False
-        if self.config.browse.skip_if_commented:
-            self_uin = self._auth.uin if self._auth else ""
-            if feed.self_commented(self_uin):
-                return False
         return True
 
     def _feed_seen(self, feed: Feed) -> bool:
@@ -802,6 +1151,14 @@ class QZonePilotPlugin(MaiBotPlugin):
 
         async def operation(client: QZoneClient) -> None:
             await client.comment(fid, target_qq, content)
+
+        await self._with_qzone(operation)
+
+    async def _qzone_like(self, fid: str, target_qq: str) -> None:
+        """点赞说说。"""
+
+        async def operation(client: QZoneClient) -> None:
+            await client.like(fid, target_qq)
 
         await self._with_qzone(operation)
 
@@ -971,10 +1328,10 @@ class QZonePilotPlugin(MaiBotPlugin):
         today = self._today_key()
         counts = daily.get(today)
         if not isinstance(counts, dict):
-            counts = {"posts": 0, "comments": 0}
+            counts = {}
             daily[today] = counts
-        counts.setdefault("posts", 0)
-        counts.setdefault("comments", 0)
+        for key in ("posts", "comments", "likes", "replies"):
+            counts.setdefault(key, 0)
         # 只保留最近 7 天。
         for key in list(daily.keys()):
             if key != today and str(key) < today:
@@ -1061,7 +1418,9 @@ class QZonePilotPlugin(MaiBotPlugin):
 
         connection = "已连接" if self._client is not None and self._client.connected else "未连接"
         last_publish = _safe_float(self._state.get("last_publish_at"), default=0.0)
+        last_like = _safe_float(self._state.get("last_like_at"), default=0.0)
         last_comment = _safe_float(self._state.get("last_comment_at"), default=0.0)
+        last_reply = _safe_float(self._state.get("last_reply_at"), default=0.0)
         daily = self._daily_counts()
         stats = self._state.get("stats") if isinstance(self._state.get("stats"), dict) else {}
         lines = [
@@ -1072,11 +1431,18 @@ class QZonePilotPlugin(MaiBotPlugin):
             f"发说说：{'开启' if self.config.publish.enabled else '关闭'}，"
             f"今日 {daily.get('posts', 0)}/{self.config.publish.max_posts_per_day}",
             f"浏览动态：{'开启' if self.config.browse.enabled else '关闭'}，"
-            f"评论 {'开启' if self.config.browse.comment_enabled else '关闭'}，"
+            f"点赞 {'开启' if self.config.browse.like_enabled else '关闭'} "
+            f"今日 {daily.get('likes', 0)}/{self.config.browse.max_likes_per_day}，"
+            f"评论 {'开启' if self.config.browse.comment_enabled else '关闭'} "
             f"今日 {daily.get('comments', 0)}/{self.config.browse.max_comments_per_day}",
-            f"累计：说说 {stats.get('posts', 0)}，评论 {stats.get('comments', 0)}",
+            f"回复评论：{'开启' if self.config.reply.enabled else '关闭'}，"
+            f"今日 {daily.get('replies', 0)}/{self.config.reply.max_replies_per_day}",
+            f"累计：说说 {stats.get('posts', 0)}，点赞 {stats.get('likes', 0)}，"
+            f"评论 {stats.get('comments', 0)}，回复 {stats.get('replies', 0)}",
             f"上次发说说：{_format_timestamp(last_publish)}",
+            f"上次点赞：{_format_timestamp(last_like)}",
             f"上次评论：{_format_timestamp(last_comment)}",
+            f"上次回复：{_format_timestamp(last_reply)}",
         ]
         return True, "\n".join(lines), True
 
@@ -1289,6 +1655,12 @@ class QZonePilotPlugin(MaiBotPlugin):
                 self._state[key] = []
         if not isinstance(self._state.get("seen_feeds"), dict):
             self._state["seen_feeds"] = {}
+        if not isinstance(self._state.get("liked_feeds"), dict):
+            self._state["liked_feeds"] = {}
+        if not isinstance(self._state.get("reply_seen"), dict):
+            self._state["reply_seen"] = {}
+        if not isinstance(self._state.get("replied_comments"), dict):
+            self._state["replied_comments"] = {}
         if not isinstance(self._state.get("daily"), dict):
             self._state["daily"] = {}
         if not isinstance(self._state.get("stats"), dict):
@@ -1299,11 +1671,19 @@ class QZonePilotPlugin(MaiBotPlugin):
         """清理过期状态。"""
 
         now = time.time()
-        seen = self._state.get("seen_feeds")
-        if isinstance(seen, dict):
-            for key, value in list(seen.items()):
-                if now - _safe_float(value, default=0.0) > _SEEN_RETENTION_SECONDS:
-                    seen.pop(key, None)
+        for state_key in ("seen_feeds", "liked_feeds", "reply_seen"):
+            seen = self._state.get(state_key)
+            if isinstance(seen, dict):
+                for key, value in list(seen.items()):
+                    if now - _safe_float(value, default=0.0) > _SEEN_RETENTION_SECONDS:
+                        seen.pop(key, None)
+
+        replied = self._state.get("replied_comments")
+        if isinstance(replied, dict):
+            for key, value in list(replied.items()):
+                created = _safe_float(value.get("time"), default=0.0) if isinstance(value, dict) else 0.0
+                if now - created > _SEEN_RETENTION_SECONDS:
+                    replied.pop(key, None)
 
         daily = self._state.get("daily")
         if isinstance(daily, dict):
@@ -1312,7 +1692,7 @@ class QZonePilotPlugin(MaiBotPlugin):
                 if str(key) < today:
                     daily.pop(key, None)
 
-        for key in ("publish_history", "comment_history"):
+        for key in ("publish_history", "comment_history", "like_history", "reply_history"):
             history = self._state.get(key)
             if isinstance(history, list):
                 self._state[key] = history[-_MAX_HISTORY:]

@@ -89,6 +89,7 @@ class FeedComment:
     content: str
     tid: int | None = None
     created_time: str = ""
+    created_at: int = 0
     parent_tid: int | None = None
     is_self: bool = False
 
@@ -262,6 +263,8 @@ class QZoneClient:
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
+    REPLY_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
+    LIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
 
     def __init__(
         self,
@@ -287,6 +290,8 @@ class QZoneClient:
         self._list_url = str(urls.get("list") or self.LIST_URL)
         self._publish_url = str(urls.get("publish") or self.PUBLISH_URL)
         self._comment_url = str(urls.get("comment") or self.COMMENT_URL)
+        self._reply_url = str(urls.get("reply") or self.REPLY_URL)
+        self._like_url = str(urls.get("like") or self.LIKE_URL)
 
     @property
     def uin(self) -> str:
@@ -485,6 +490,129 @@ class QZoneClient:
         if code != 0:
             raise QZoneError(f"评论失败（code={code}）", code=code)
 
+    async def like(self, fid: str, target_qq: str) -> None:
+        """给一条说说点赞。
+
+        Args:
+            fid: 说说 ID。
+            target_qq: 说说作者 QQ。
+
+        Raises:
+            QZoneError: 点赞失败时。
+        """
+
+        feed_id = str(fid or "").strip()
+        target = str(target_qq or "").strip()
+        if not feed_id or not target.isdigit():
+            raise QZoneError("点赞参数不完整")
+
+        unikey = f"http://user.qzone.qq.com/{target}/mood/{feed_id}"
+        data = {
+            "qzreferrer": f"https://user.qzone.qq.com/{self.auth.uin}",
+            "opuin": self.auth.uin,
+            "unikey": unikey,
+            "curkey": unikey,
+            "appid": 311,
+            "from": 1,
+            "typeid": 0,
+            "abstime": int(time.time()),
+            "fid": feed_id,
+            "active": 0,
+            "format": "json",
+            "fupdate": 1,
+        }
+        params = {"g_tk": self.auth.gtk}
+        headers = {
+            "User-Agent": _USER_AGENT,
+            "Referer": f"https://user.qzone.qq.com/{self.auth.uin}",
+            "Origin": "https://user.qzone.qq.com",
+        }
+        response_text = await self._request_text("POST", self._like_url, params=params, data=data, headers=headers)
+        payload = _extract_balanced_object(response_text)
+        if payload is None:
+            try:
+                payload = _extract_jsonp(response_text)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            snippet = re.sub(r"\s+", " ", response_text)[:200]
+            raise QZoneError(f"点赞响应无法解析: {snippet}")
+        code = _safe_int(payload.get("code"), default=-1)
+        if code != 0:
+            raise QZoneError(f"点赞失败（code={code}）", code=code)
+
+    async def reply(
+        self,
+        fid: str,
+        target_qq: str,
+        *,
+        target_nickname: str,
+        target_comment_qq: str,
+        comment_tid: int | str,
+        content: str,
+    ) -> None:
+        """回复自己说说下的一条评论。
+
+        Args:
+            fid: 说说 ID。
+            target_qq: 说说所属 QQ（通常是当前登录账号）。
+            target_nickname: 被回复者昵称。
+            target_comment_qq: 被回复者 QQ。
+            comment_tid: 被回复评论的 tid。
+            content: 回复正文（不包含 @ 前缀）。
+
+        Raises:
+            QZoneError: 回复失败时。
+        """
+
+        feed_id = str(fid or "").strip()
+        target = str(target_qq or "").strip()
+        comment_owner = str(target_comment_qq or "").strip()
+        text = str(content or "").strip()
+        if not feed_id or not target.isdigit() or not comment_owner.isdigit():
+            raise QZoneError("回复评论参数不完整")
+        if not text:
+            raise QZoneError("回复内容不能为空")
+
+        try:
+            comment_id = int(comment_tid)
+        except (TypeError, ValueError) as exc:
+            raise QZoneError("回复评论缺少有效的 comment_tid") from exc
+
+        nickname = re.sub(r"[{},]", "", str(target_nickname or comment_owner)).strip()
+        data = {
+            "topicId": f"{target}_{feed_id}__1",
+            "uin": self.auth.uin,
+            "hostUin": target,
+            "feedsType": 100,
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+            "content": f"@{{uin:{comment_owner},nick:{nickname},auto:1}}{text}",
+            "format": "fs",
+            "plat": "qzone",
+            "source": "ic",
+            "platformid": 52,
+            "ref": "feeds",
+            "commentId": comment_id,
+            "commentUin": comment_owner,
+            "richtype": "",
+            "richval": "",
+            "paramstr": "1",
+        }
+        params = {"g_tk": self.auth.gtk}
+        headers = {
+            "User-Agent": _USER_AGENT,
+            "Referer": f"https://user.qzone.qq.com/{self.auth.uin}",
+            "Origin": "https://user.qzone.qq.com",
+        }
+        response_text = await self._request_text("POST", self._reply_url, params=params, data=data, headers=headers)
+        code = _extract_callback_code(response_text)
+        if code is None:
+            snippet = re.sub(r"\s+", " ", response_text)[:200]
+            raise QZoneError(f"回复响应无法解析: {snippet}")
+        if code != 0:
+            raise QZoneError(f"回复失败（code={code}）", code=code)
+
     async def _request_text(
         self,
         method: str,
@@ -546,6 +674,7 @@ class QZoneClient:
                 content=_decode_text(raw_comment.get("content")),
                 tid=comment_tid or None,
                 created_time=str(raw_comment.get("createTime2") or raw_comment.get("createTime") or ""),
+                created_at=_safe_int(raw_comment.get("create_time")),
                 is_self=str(raw_comment.get("uin") or "").strip() == self.auth.uin,
             )
             comments.append(comment)
@@ -562,6 +691,7 @@ class QZoneClient:
                         created_time=str(
                             sub_comment.get("createTime2") or sub_comment.get("createTime") or ""
                         ),
+                        created_at=_safe_int(sub_comment.get("create_time")),
                         parent_tid=comment_tid or None,
                         is_self=str(sub_comment.get("uin") or "").strip() == self.auth.uin,
                     )

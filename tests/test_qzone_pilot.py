@@ -132,12 +132,16 @@ class FakeQZoneServer:
         self.app.router.add_get("/list", self._handle_list)
         self.app.router.add_post("/publish", self._handle_publish)
         self.app.router.add_post("/comment", self._handle_comment)
+        self.app.router.add_post("/like", self._handle_like)
+        self.app.router.add_post("/reply", self._handle_reply)
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self.port = 0
         self.feeds: list[dict[str, Any]] = []
         self.published: list[str] = []
         self.comments: list[dict[str, str]] = []
+        self.likes: list[dict[str, str]] = []
+        self.replies: list[dict[str, str]] = []
         self.list_error_code: int | None = None
 
     async def start(self) -> None:
@@ -165,6 +169,8 @@ class FakeQZoneServer:
             "list": f"{self.base_url}/list",
             "publish": f"{self.base_url}/publish",
             "comment": f"{self.base_url}/comment",
+            "reply": f"{self.base_url}/reply",
+            "like": f"{self.base_url}/like",
         }
 
     async def _handle_list(self, request: web.Request) -> web.Response:
@@ -191,6 +197,30 @@ class FakeQZoneServer:
         self.comments.append(
             {
                 "topicId": str(form.get("topicId") or ""),
+                "content": str(form.get("content") or ""),
+            }
+        )
+        return web.Response(
+            text='<script>frameElement.callback({"code":0,"message":""});</script>',
+            content_type="text/html",
+        )
+
+    async def _handle_like(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        self.likes.append(
+            {
+                "fid": str(form.get("fid") or ""),
+                "unikey": str(form.get("unikey") or ""),
+            }
+        )
+        return web.json_response({"code": 0, "message": ""})
+
+    async def _handle_reply(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        self.replies.append(
+            {
+                "topicId": str(form.get("topicId") or ""),
+                "commentId": str(form.get("commentId") or ""),
                 "content": str(form.get("content") or ""),
             }
         )
@@ -270,6 +300,7 @@ class QZonePilotTestCase(unittest.IsolatedAsyncioTestCase):
         self.config_data["notify"]["admin_qqs"] = ["99999"]
         self.config_data["publish"]["initial_delay_seconds"] = 3600
         self.config_data["browse"]["initial_delay_seconds"] = 3600
+        self.config_data["reply"]["initial_delay_seconds"] = 3600
         self.config_data["publish"]["min_interval_minutes"] = 5
         self.config_data["browse"]["min_comment_interval_minutes"] = 1
         self.config_data["browse"]["watch_friends"] = ["3213691924"]
@@ -319,15 +350,45 @@ class QZonePilotTestCase(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-    async def _comment_response(self, comment: str, *, should_comment: bool = True, confidence: float = 0.9) -> None:
+    async def _comment_response(
+        self,
+        comment: str,
+        *,
+        should_comment: bool = True,
+        confidence: float = 0.9,
+        should_like: bool = False,
+    ) -> None:
         self.context.llm_responses.append(
             {
                 "success": True,
                 "response": json.dumps(
                     {
+                        "should_like": should_like,
                         "should_comment": should_comment,
                         "confidence": confidence,
                         "comment": comment,
+                        "reason": "测试",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    async def _reply_response(
+        self,
+        reply: str,
+        *,
+        should_reply: bool = True,
+        confidence: float = 0.9,
+    ) -> None:
+        self.context.llm_responses.append(
+            {
+                "success": True,
+                "response": json.dumps(
+                    {
+                        "should_reply": should_reply,
+                        "confidence": confidence,
+                        "reply": reply,
                         "reason": "测试",
                     },
                     ensure_ascii=False,
@@ -399,6 +460,7 @@ class QZonePilotTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_comment_disabled(self) -> None:
         self.config_data["browse"]["comment_enabled"] = False
+        self.config_data["browse"]["like_enabled"] = False
         self.plugin.set_plugin_config(self.config_data)
         await self._start()
         await self.plugin._maybe_browse(force=True)
@@ -417,6 +479,151 @@ class QZonePilotTestCase(unittest.IsolatedAsyncioTestCase):
         await self._comment_response("看起来不错")
         await self.plugin._maybe_browse(force=True)
         self.assertEqual(self.qzone.comments, [])
+        self.assertEqual(self.context.llm_calls, [])
+
+    async def test_like_success(self) -> None:
+        await self._start()
+        await self._comment_response("", should_comment=False, should_like=True)
+        await self.plugin._maybe_browse(force=True)
+        self.assertEqual(len(self.qzone.likes), 1)
+        self.assertEqual(self.qzone.likes[0]["fid"], "feed-1")
+        self.assertEqual(self.plugin._state["stats"]["likes"], 1)
+        self.assertEqual(len(self.plugin._state["like_history"]), 1)
+
+    async def test_like_only_once(self) -> None:
+        await self._start()
+        await self._comment_response("", should_comment=False, should_like=True)
+        await self.plugin._maybe_browse(force=True)
+        await self._comment_response("", should_comment=False, should_like=True)
+        await self.plugin._maybe_browse(force=True)
+        self.assertEqual(len(self.qzone.likes), 1)
+
+    async def test_like_disabled(self) -> None:
+        self.config_data["browse"]["like_enabled"] = False
+        self.config_data["browse"]["comment_enabled"] = False
+        self.plugin.set_plugin_config(self.config_data)
+        await self._start()
+        await self.plugin._maybe_browse(force=True)
+        self.assertEqual(self.qzone.likes, [])
+        self.assertEqual(self.context.llm_calls, [])
+
+    def _set_own_feed(self, commentlist: list[dict[str, Any]]) -> None:
+        now = int(time.time())
+        self.qzone.feeds = [
+            {
+                "tid": "own-1",
+                "uin": 3864117714,
+                "name": "麦麦",
+                "created_time": now - 600,
+                "content": "今天随便煮了点东西",
+                "secret": 0,
+                "ugc_right": 1,
+                "commentlist": commentlist,
+            }
+        ]
+
+    async def test_reply_success(self) -> None:
+        await self._start()
+        self._set_own_feed(
+            [
+                {
+                    "uin": 3213691924,
+                    "name": "好友A",
+                    "content": "这看着也太香了",
+                    "tid": 7,
+                    "create_time": int(time.time()) - 120,
+                    "createTime2": "2026-10-21 17:00:00",
+                }
+            ]
+        )
+        await self._reply_response("下次给你留一份")
+        success, message = await self.plugin._maybe_reply(force=True)
+        self.assertTrue(success, message)
+        self.assertEqual(len(self.qzone.replies), 1)
+        self.assertEqual(self.qzone.replies[0]["commentId"], "7")
+        self.assertIn("下次给你留一份", self.qzone.replies[0]["content"])
+        self.assertEqual(self.plugin._state["stats"]["replies"], 1)
+        self.assertEqual(len(self.plugin._state["reply_history"]), 1)
+
+    async def test_reply_only_once(self) -> None:
+        await self._start()
+        self._set_own_feed(
+            [
+                {
+                    "uin": 3213691924,
+                    "name": "好友A",
+                    "content": "这看着也太香了",
+                    "tid": 7,
+                    "create_time": int(time.time()) - 120,
+                }
+            ]
+        )
+        await self._reply_response("下次给你留一份")
+        await self.plugin._maybe_reply(force=True)
+        await self._reply_response("再来一条")
+        await self.plugin._maybe_reply(force=True)
+        self.assertEqual(len(self.qzone.replies), 1)
+
+    async def test_reply_skips_self_comment(self) -> None:
+        await self._start()
+        self._set_own_feed(
+            [
+                {
+                    "uin": 3864117714,
+                    "name": "麦麦",
+                    "content": "自己回复自己",
+                    "tid": 8,
+                    "create_time": int(time.time()) - 60,
+                }
+            ]
+        )
+        await self.plugin._maybe_reply(force=True)
+        self.assertEqual(self.qzone.replies, [])
+        self.assertEqual(self.context.llm_calls, [])
+
+    async def test_reply_skips_already_replied(self) -> None:
+        await self._start()
+        self._set_own_feed(
+            [
+                {
+                    "uin": 3213691924,
+                    "name": "好友A",
+                    "content": "这看着也太香了",
+                    "tid": 7,
+                    "create_time": int(time.time()) - 120,
+                    "list_3": [
+                        {
+                            "uin": 3864117714,
+                            "name": "麦麦",
+                            "content": "下次给你留一份",
+                            "tid": 9,
+                            "create_time": int(time.time()) - 60,
+                        }
+                    ],
+                }
+            ]
+        )
+        await self.plugin._maybe_reply(force=True)
+        self.assertEqual(self.qzone.replies, [])
+        self.assertEqual(self.context.llm_calls, [])
+
+    async def test_reply_disabled(self) -> None:
+        self.config_data["reply"]["enabled"] = False
+        self.plugin.set_plugin_config(self.config_data)
+        await self._start()
+        self._set_own_feed(
+            [
+                {
+                    "uin": 3213691924,
+                    "name": "好友A",
+                    "content": "这看着也太香了",
+                    "tid": 7,
+                    "create_time": int(time.time()) - 120,
+                }
+            ]
+        )
+        await self.plugin._maybe_reply(force=True)
+        self.assertEqual(self.qzone.replies, [])
         self.assertEqual(self.context.llm_calls, [])
 
     async def test_status_command(self) -> None:
@@ -459,6 +666,8 @@ class QZoneClientTestCase(unittest.IsolatedAsyncioTestCase):
                 "list": f"{self.server.base_url}/list",
                 "publish": f"{self.server.base_url}/publish",
                 "comment": f"{self.server.base_url}/comment",
+                "reply": f"{self.server.base_url}/reply",
+                "like": f"{self.server.base_url}/like",
             },
         )
 
@@ -498,6 +707,25 @@ class QZoneClientTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.server.comments), 1)
         self.assertEqual(self.server.comments[0]["content"], "好吃")
 
+    async def test_like(self) -> None:
+        await self.client.like("f1", "3213691924")
+        self.assertEqual(len(self.server.likes), 1)
+        self.assertEqual(self.server.likes[0]["fid"], "f1")
+
+    async def test_reply(self) -> None:
+        await self.client.reply(
+            "own-1",
+            "3864117714",
+            target_nickname="好友A",
+            target_comment_qq="3213691924",
+            comment_tid=7,
+            content="下次给你留一份",
+        )
+        self.assertEqual(len(self.server.replies), 1)
+        self.assertEqual(self.server.replies[0]["commentId"], "7")
+        self.assertIn("下次给你留一份", self.server.replies[0]["content"])
+        self.assertIn("uin:3213691924", self.server.replies[0]["content"])
+
     async def test_list_error(self) -> None:
         self.server.list_error_code = -3000
         with self.assertRaises(qzone_module.QZoneError):
@@ -525,6 +753,24 @@ class UtilityTestCase(unittest.TestCase):
     def test_similarity(self) -> None:
         self.assertGreater(decision_module.content_similarity("今天天气很好", "今天天气很好"), 0.99)
         self.assertLess(decision_module.content_similarity("今天天气很好", "完全不同的内容"), 0.2)
+
+    def test_parse_like_only(self) -> None:
+        decision = decision_module.parse_comment_decision(
+            '{"should_like": true, "should_comment": false, "confidence": 0.8, "reason": "不错"}'
+        )
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertTrue(decision.should_like)
+        self.assertFalse(decision.should_comment)
+
+    def test_parse_reply(self) -> None:
+        decision = decision_module.parse_reply_decision(
+            '{"should_reply": true, "confidence": 0.9, "reply": "下次一起", "reason": "友好"}'
+        )
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply, "下次一起")
 
 
 if __name__ == "__main__":

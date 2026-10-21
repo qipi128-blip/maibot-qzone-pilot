@@ -4,9 +4,10 @@
 
 - **自主发说说**：定时收集最近聊天、历史说说和好友动态灵感，由模型判断“现在想不想发、发什么”，确认后发布到 QQ 空间。
 - **看好友动态**：定时读取好友的说说（文字、图片数量、已有评论）。
-- **按人设评论**：模型判断某条动态是否值得评论、评论什么；默认只读，确认风格后再开启评论。
+- **点赞 / 评论**：模型判断某条动态是否值得点赞、是否值得评论；评论默认关闭。
+- **回复自己的评论**：定时检查自己说说下的新评论，由模型决定是否回复、回复什么。
 - **防刷屏**：活动时间、最小间隔、每日上限、内容去重、已读去重、错误节流。
-- **演练模式**：只生成内容 / 评论并通知管理员，不真正发布。
+- **演练模式**：只生成内容 / 点赞 / 评论 / 回复并通知管理员，不真正执行。
 
 > 适用平台：NapCat（Napcat 适配器）。插件直接连接 NapCat 的正向 WebSocket，
 > 用 `get_cookies` 获取 QQ 空间 Cookie，不依赖扫码登录；读取和发布通过 QQ 空间
@@ -23,6 +24,7 @@
    - 想先观察效果时打开 `plugin.dry_run = true`。
    - 确认人设和风格后，再把 `publish.enabled` 打开；它默认关闭，避免刚装上就自动发内容。
    - 想评论好友动态时，再把 `browse.comment_enabled` 打开（默认关闭）。
+   - 点赞默认开启，可用 `browse.like_enabled` 关闭；回复自己的评论默认开启，可用 `reply.enabled` 关闭。
 
 插件会自动读取 `plugins/Napcat-Adapter/config.toml` 的 `[napcat_server]`。
 如果自动发现失败，手动填写：
@@ -53,19 +55,29 @@ auto_discover = false
 - 最近发过的说说；
 - 最近浏览到的好友动态（只作灵感）。
 
-### 看好友动态 / 评论
+### 看好友动态 / 点赞 / 评论
 
 每 `browse.check_interval_minutes` 分钟检查一次：
 
 1. 目标来源：`watch_friends` 指定 QQ；为空且 `auto_friends = true` 时自动取好友列表，并轮流检查。
 2. 读取每个好友最近 `feeds_per_friend` 条说说。
-3. 过滤：已看过、太旧、仅自己可见、部分好友可见、疑似广告、自己已评论过。
-4. 只有 `browse.comment_enabled = true` 时才会让模型决定是否评论。
-5. 评论还会受 `max_comments_per_day`、`min_comment_interval_minutes`、`min_confidence` 限制。
-6. 已经评论过的动态会写入 `seen_feeds`，不会重复评论。
+3. 过滤：已看过、太旧、仅自己可见、部分好友可见、疑似广告。
+4. 只有 `browse.like_enabled` 或 `browse.comment_enabled` 开启时才会让模型看候选动态。
+5. 点赞受 `max_likes_per_day`、`like_min_confidence` 限制；已经点过赞的动态会写入 `liked_feeds`，不会重复点赞。
+6. 评论受 `max_comments_per_day`、`min_comment_interval_minutes`、`min_confidence` 限制；已经评论过的动态不会重复评论。
 
 > **评论默认关闭**。自动评论是社交行为，建议先开 `dry_run` 观察模型输出，
 > 再开启 `comment_enabled`，并从小范围 `watch_friends` 开始。
+
+### 回复自己说说下的评论
+
+每 `reply.check_interval_minutes` 分钟检查一次：
+
+1. 读取自己最近 `own_post_limit` 条说说。
+2. 找出 `max_comment_age_hours` 内、非自己发的、且自己还没有回复过的新评论。
+3. 模型结合原说说和评论内容，决定是否回复、回复什么。
+4. 受 `max_replies_per_day`、`max_replies_per_cycle`、`min_confidence` 限制；已经处理过的评论会写入 `reply_seen`，不会重复回复。
+5. 回复内容由 QQ 空间自动带上被回复者，不需要手动 @。
 
 ## 配置说明
 
@@ -127,12 +139,33 @@ auto_discover = false
 | `feeds_per_friend` | `3` | 每人几条 |
 | `max_candidates_per_cycle` | `6` | 每轮最多让模型看几条候选 |
 | `max_feed_age_hours` | `72` | 只考虑多少小时内 |
+| `like_enabled` | `true` | 是否让模型决定点赞 |
+| `max_likes_per_day` | `5` | 每日点赞上限 |
+| `like_min_confidence` | `0.7` | 点赞最低置信度 |
 | `comment_enabled` | `false` | 是否真的评论 |
 | `max_comments_per_day` | `2` | 每日评论上限 |
 | `min_comment_interval_minutes` | `30` | 评论最小间隔 |
 | `min_confidence` | `0.72` | 评论最低置信度 |
 | `skip_if_commented` | `true` | 自己已评论过就跳过 |
 | `comment_max_chars` | `80` | 评论最大长度 |
+
+### `[reply]`
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 是否自动回复自己说说下的新评论 |
+| `check_interval_minutes` | `15` | 检查间隔 |
+| `active_hours_start` / `active_hours_end` | `08:00` / `23:30` | 活动时间 |
+| `own_post_limit` | `5` | 每轮检查最近几条自己的说说 |
+| `max_post_age_hours` | `168` | 只检查多少小时内发布的说说 |
+| `max_comment_age_hours` | `48` | 只回复多少小时内的评论 |
+| `max_comments_per_cycle` | `3` | 每轮最多让模型看几条候选评论 |
+| `max_replies_per_day` | `3` | 每日回复上限 |
+| `max_replies_per_cycle` | `1` | 每轮最多回复几条 |
+| `min_confidence` | `0.7` | 回复最低置信度 |
+| `reply_max_chars` | `100` | 回复最大长度 |
+| `initial_delay_seconds` | `120` | 加载后首次检查延迟 |
+| `jitter_seconds` | `120` | 每轮随机抖动 |
 
 ### `[notify]`
 
@@ -141,7 +174,9 @@ auto_discover = false
 | `enabled` | `true` | 是否通知 |
 | `admin_qqs` | `[]` | 管理员 QQ |
 | `notify_on_post` | `true` | 发说说后通知 |
+| `notify_on_like` | `true` | 点赞后通知 |
 | `notify_on_comment` | `true` | 评论后通知 |
+| `notify_on_reply` | `true` | 回复评论后通知 |
 | `notify_on_error` | `true` | 错误通知（5 分钟节流） |
 
 ### `[prompt]`
@@ -151,6 +186,7 @@ auto_discover = false
 | `persona_override` | 空 | 自定义人设；留空读取主程序人格 |
 | `publish_style` | 空 | 发说说额外风格 |
 | `comment_style` | 空 | 评论额外风格 |
+| `reply_style` | 空 | 回复评论额外风格 |
 
 ### `[qzone]`
 
